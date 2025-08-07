@@ -38,13 +38,11 @@ private:
   void vescStateCallback(const vesc_msgs::msg::VescStateStamped::SharedPtr state);
   void imuCallback(const vesc_msgs::msg::VescImuStamped::SharedPtr imu);
   void servoCmdCallback(const std_msgs::msg::Float64::SharedPtr servo);
-  void originalOdomCallback(const nav_msgs::msg::Odometry::SharedPtr odom);
 
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
   rclcpp::Subscription<vesc_msgs::msg::VescStateStamped>::SharedPtr vesc_state_sub_;
   rclcpp::Subscription<vesc_msgs::msg::VescImuStamped>::SharedPtr imu_sub_;
   rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr servo_sub_;
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr original_odom_sub_;
 
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_pub_;
 
@@ -125,7 +123,7 @@ Eigen::Vector3d EKF::getState() {
 
 VescToMyOdom::VescToMyOdom(const rclcpp::NodeOptions & options)
 : Node("vesc_to_my_odom_node", options),
-  x_(0.0), y_(0.0), initial_yaw_(std::numeric_limits<double>::quiet_NaN()),
+  x_(0.0), y_(0.0), initial_yaw_(0.0),
   imu_yaw_rate_(0.0), real_yaw_rate_(0.0), last_servo_cmd_(nullptr),
   ekf_initialized_(false), initialization_time_(rclcpp::Time(0))
 {
@@ -139,7 +137,7 @@ VescToMyOdom::VescToMyOdom(const rclcpp::NodeOptions & options)
   publish_tf_ = declare_parameter("publish_tf", false);
   use_servo_cmd_ = declare_parameter("use_servo_cmd_to_calc_angular_velocity", true);
 
-  odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("my_odom", 10);
+  odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("odom", 10);
   
   if (publish_tf_) {
     tf_pub_.reset(new tf2_ros::TransformBroadcaster(this));
@@ -156,63 +154,17 @@ VescToMyOdom::VescToMyOdom(const rclcpp::NodeOptions & options)
       "sensors/servo_position_command", 10, std::bind(&VescToMyOdom::servoCmdCallback, this, _1));
   }
   
-  original_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-    "odom", 10, std::bind(&VescToMyOdom::originalOdomCallback, this, _1));
 
+  // Initialize EKF at origin
+  Eigen::Vector3d init_state;
+  init_state(0) = 0.0;  // x
+  init_state(1) = 0.0;  // y
+  init_state(2) = 0.0;  // yaw
+  ekf_.setState(init_state);
+  
   last_time_ = this->now();
 }
 
-void VescToMyOdom::originalOdomCallback(const nav_msgs::msg::Odometry::SharedPtr odom) {
-  if (!ekf_initialized_ && !std::isnan(initial_yaw_)) {
-    x_ = odom->pose.pose.position.x;
-    y_ = odom->pose.pose.position.y;
-    
-    double qz = odom->pose.pose.orientation.z;
-    double qw = odom->pose.pose.orientation.w;
-    double original_yaw = 2.0 * atan2(qz, qw);
-    
-    Eigen::Vector3d init_state;
-    init_state(0) = x_;
-    init_state(1) = y_;
-    init_state(2) = original_yaw;
-    ekf_.setState(init_state);
-    
-    ekf_initialized_ = true;
-    initialization_time_ = odom->header.stamp;
-    last_time_ = odom->header.stamp;
-    
-    RCLCPP_INFO(this->get_logger(), "EKF initialized with original odom: (%.3f, %.3f, %.3f°)", 
-                x_, y_, original_yaw * 180/M_PI);
-    
-    nav_msgs::msg::Odometry init_odom_msg;
-    init_odom_msg.header.stamp = odom->header.stamp;
-    init_odom_msg.header.frame_id = odom_frame_;
-    init_odom_msg.child_frame_id = base_frame_;
-    
-    init_odom_msg.pose.pose.position.x = x_;
-    init_odom_msg.pose.pose.position.y = y_;
-    init_odom_msg.pose.pose.position.z = 0.0;
-    init_odom_msg.pose.pose.orientation.x = 0.0;
-    init_odom_msg.pose.pose.orientation.y = 0.0;
-    init_odom_msg.pose.pose.orientation.z = sin(original_yaw / 2.0);
-    init_odom_msg.pose.pose.orientation.w = cos(original_yaw / 2.0);
-    
-    init_odom_msg.pose.covariance[0] = 0.1;
-    init_odom_msg.pose.covariance[7] = 0.1;
-    init_odom_msg.pose.covariance[35] = 0.2;
-    
-    odom_pub_->publish(init_odom_msg);
-    
-    while (!vesc_buffer_.empty()) {
-      auto buffered_state = vesc_buffer_.front();
-      vesc_buffer_.pop();
-      rclcpp::Time buffer_time(buffered_state->header.stamp);
-      if (buffer_time >= initialization_time_) {
-        vescStateCallback(buffered_state);
-      }
-    }
-  }
-}
 
 void VescToMyOdom::imuCallback(const vesc_msgs::msg::VescImuStamped::SharedPtr imu) {
   double measured_yaw_deg = -imu->imu.ypr.z;
@@ -224,12 +176,24 @@ void VescToMyOdom::imuCallback(const vesc_msgs::msg::VescImuStamped::SharedPtr i
   
   real_yaw_rate_ = imu_yaw_rate_;
 
-  if (std::isnan(initial_yaw_)) {
-    initial_yaw_ = measured_yaw_rad;
-    RCLCPP_INFO(this->get_logger(), "Initial IMU Yaw Set: %f rad (%f deg)", initial_yaw_, measured_yaw_deg);
-  }
-
   if (!ekf_initialized_) {
+    initial_yaw_ = measured_yaw_rad;
+    ekf_initialized_ = true;
+    initialization_time_ = imu->header.stamp;
+    last_time_ = imu->header.stamp;
+    
+    RCLCPP_INFO(this->get_logger(), "EKF initialized at origin with IMU yaw: %f rad (%f deg)", 
+                initial_yaw_, measured_yaw_deg);
+    
+    // Process any buffered VESC messages
+    while (!vesc_buffer_.empty()) {
+      auto buffered_state = vesc_buffer_.front();
+      vesc_buffer_.pop();
+      rclcpp::Time buffer_time(buffered_state->header.stamp);
+      if (buffer_time >= initialization_time_) {
+        vescStateCallback(buffered_state);
+      }
+    }
     return;
   }
 
