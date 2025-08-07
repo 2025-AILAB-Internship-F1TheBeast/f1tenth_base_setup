@@ -96,10 +96,11 @@ class PynputCursesKeyTeleop(Node):
         self._max_rotation_rate = 1.0
         
         # Progressive acceleration settings
-        self._acceleration_time = 2.0  # Time to reach max speed (seconds) - only for linear
-        self._deceleration_time = 0.5  # Time to stop when key released (seconds) - only for linear
-        self._steering_acceleration_time = 0.3  # Fast steering response (seconds)
-        self._steering_deceleration_time = 0.2  # Quick steering return to center (seconds)
+        self._acceleration_time = 0.5  # Time to reach max speed (seconds) - only for linear
+        self._deceleration_time = 1.0  # Time to stop when key released (seconds) - only for linear
+        self._steering_acceleration_time = 0.35  # Fast steering response (seconds)
+        self._steering_deceleration_time = 0.3  # Quick steering return to center (seconds)
+        self._initial_linear_speed = 0.4  # Initial speed when key is first pressed (m/s)
         
         # Message type toggle (True for Ackermann, False for Twist)
         self._use_ackermann = True
@@ -209,11 +210,13 @@ class PynputCursesKeyTeleop(Node):
                     # Apply easing for smoother acceleration (quadratic ease-in)
                     progress = progress * progress
                     
-                    # Scale by maximum rates
+                    # Scale by maximum rates - starts from initial speed
                     if l > 0:  # Forward
-                        target_linear += l * progress * self._max_forward_rate
+                        speed_range = self._max_forward_rate - self._initial_linear_speed
+                        target_linear += l * (self._initial_linear_speed + progress * speed_range)
                     else:  # Backward
-                        target_linear += l * progress * self._max_backward_rate
+                        speed_range = self._max_backward_rate - self._initial_linear_speed
+                        target_linear += l * (self._initial_linear_speed + progress * speed_range)
                     
                     # Add to active keys for display with progress
                     key_name = self._get_key_name(key)
