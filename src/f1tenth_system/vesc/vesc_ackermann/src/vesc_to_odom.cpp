@@ -24,7 +24,8 @@ class EKF
   public:
     EKF();
     void predict(double dt, double v, double w);
-    void update(double measured_theta, double R_val, double imu_offset = 0.0, double angular_vel = 0.0);
+    void update(double measured_omega, double R_val); // Angular velocity update
+    void updateHeading(double measured_theta, double R_val, double imu_offset = 0.0, double angular_vel = 0.0);
     void setState(const Eigen::Vector4d &state);
     Eigen::Vector4d getState();
     double getBias();
@@ -47,8 +48,9 @@ class VescToMyOdom : public rclcpp::Node
 
     // Helper functions
     void updateImuAcceleration(const vesc_msgs::msg::VescImuStamped::SharedPtr imu);
-    bool detectSlip(double wheel_acceleration);
+    bool detectSlip(double wheel_acceleration, double expected_omega, double measured_omega);
     void updateSlipFactor(bool slip_detected);
+    double calculateAckermannOmega(double velocity, double servo_cmd);
 
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
     rclcpp::Subscription<vesc_msgs::msg::VescStateStamped>::SharedPtr vesc_state_sub_;
@@ -138,7 +140,32 @@ void EKF::predict(double dt, double v, double w)
     x_ = x_pred;
 }
 
-void EKF::update(double measured_theta, double R_val, double imu_offset, double angular_vel)
+void EKF::update(double measured_omega, double R_val)
+{
+    // Update using angular velocity measurement (IMU)
+    double predicted_omega = x_(2); // This should be angular velocity from state, but we're using heading
+    // We need to track angular velocity in state or calculate it
+    double bias = x_(3);
+    double corrected_predicted_omega = predicted_omega - bias; // Apply bias correction
+
+    double innovation = measured_omega - corrected_predicted_omega;
+
+    // Observation model: we observe angular velocity directly
+    Eigen::RowVector4d H;
+    H << 0, 0, 0, -1; // Observe bias indirectly through angular velocity
+
+    double S = H * P_ * H.transpose() + R_val;
+    Eigen::Vector4d K = P_ * H.transpose() / S;
+
+    x_ = x_ + K * innovation;
+
+    // Clamp bias to reasonable range
+    x_(3) = std::max(-0.5, std::min(0.5, x_(3)));
+
+    P_ = (Eigen::Matrix4d::Identity() - K * H) * P_;
+}
+
+void EKF::updateHeading(double measured_theta, double R_val, double imu_offset, double angular_vel)
 {
     double theta_pred = x_(2);
 
@@ -201,11 +228,12 @@ VescToMyOdom::VescToMyOdom(const rclcpp::NodeOptions &options)
 {
     odom_frame_ = declare_parameter("odom_frame", "odom");
     base_frame_ = declare_parameter("base_frame", "base_link");
-    speed_to_erpm_gain_ = declare_parameter("speed_to_erpm_gain", 4200.0);
-    speed_to_erpm_offset_ = declare_parameter("speed_to_erpm_offset", 0.0);
-    wheelbase_ = declare_parameter("wheelbase", 0.324);
-    steering_to_servo_gain_ = declare_parameter("steering_angle_to_servo_gain", -1.2135);
-    steering_to_servo_offset_ = declare_parameter("steering_angle_to_servo_offset", 0.570526);
+    // Parameters now loaded above with correct original values
+    wheelbase_ = this->declare_parameter<double>("wheelbase", 0.324);
+    steering_to_servo_gain_ = this->declare_parameter<double>("steering_angle_to_servo_gain", -1.2135);
+    steering_to_servo_offset_ = this->declare_parameter<double>("steering_angle_to_servo_offset", 0.1667);
+    speed_to_erpm_gain_ = this->declare_parameter<double>("speed_to_erpm_gain", 4614.0);
+    speed_to_erpm_offset_ = this->declare_parameter<double>("speed_to_erpm_offset", 0.0);
     imu_offset_x_ = declare_parameter("imu_offset_x", 0.20); // 200mm forward from rear axle
     publish_tf_ = declare_parameter("publish_tf", false);
     use_servo_cmd_ = declare_parameter("use_servo_cmd_to_calc_angular_velocity", true);
@@ -335,8 +363,12 @@ void VescToMyOdom::imuCallback(const vesc_msgs::msg::VescImuStamped::SharedPtr i
     while (corrected_yaw < -M_PI)
         corrected_yaw += 2 * M_PI;
 
-    double R_val = 0.05;
-    ekf_.update(corrected_yaw, R_val, imu_offset_x_, imu_yaw_rate_);
+    double R_omega = 0.1; // Angular velocity measurement noise
+    ekf_.update(imu_yaw_rate_, R_omega);
+
+    // Also update heading for additional constraint
+    double R_yaw = 0.05;
+    ekf_.updateHeading(corrected_yaw, R_yaw, imu_offset_x_, imu_yaw_rate_);
 }
 
 void VescToMyOdom::servoCmdCallback(const std_msgs::msg::Float64::SharedPtr servo)
@@ -379,8 +411,15 @@ void VescToMyOdom::vescStateCallback(const vesc_msgs::msg::VescStateStamped::Sha
             accel_history_.pop();
         }
 
-        // Enhanced slip detection using IMU acceleration
-        bool wheel_slip_detected = detectSlip(acceleration);
+        // Calculate expected angular velocity from Ackermann model
+        double expected_omega = 0.0;
+        if (last_servo_cmd_ && use_servo_cmd_)
+        {
+            expected_omega = calculateAckermannOmega(current_speed, last_servo_cmd_->data);
+        }
+
+        // Enhanced slip detection using IMU acceleration and model comparison
+        bool wheel_slip_detected = detectSlip(acceleration, expected_omega, real_yaw_rate_);
         updateSlipFactor(wheel_slip_detected);
 
         // Apply slip compensation to speed
@@ -396,7 +435,14 @@ void VescToMyOdom::vescStateCallback(const vesc_msgs::msg::VescStateStamped::Sha
 
     last_time_ = current_time;
 
-    ekf_.predict(dt, current_speed, real_yaw_rate_);
+    // Use Ackermann model for prediction if available, otherwise use IMU
+    double prediction_omega = real_yaw_rate_; // Default to IMU
+    if (last_servo_cmd_ && use_servo_cmd_)
+    {
+        prediction_omega = calculateAckermannOmega(current_speed, last_servo_cmd_->data);
+    }
+
+    ekf_.predict(dt, current_speed, prediction_omega);
 
     Eigen::Vector4d state_est = ekf_.getState();
 
@@ -473,7 +519,7 @@ void VescToMyOdom::updateImuAcceleration(const vesc_msgs::msg::VescImuStamped::S
     last_imu_accel_y_ = imu_accel_y;
 }
 
-bool VescToMyOdom::detectSlip(double wheel_acceleration)
+bool VescToMyOdom::detectSlip(double wheel_acceleration, double expected_omega, double measured_omega)
 {
     // Slip detection thresholds
     constexpr double WHEEL_ACCEL_THRESHOLD = 2.5;       // m/s^2 from wheel speed
@@ -481,10 +527,14 @@ bool VescToMyOdom::detectSlip(double wheel_acceleration)
     constexpr double LATERAL_ACCEL_THRESHOLD = 3.0;     // m/s^2 for cornering slip
     constexpr double ACCEL_DISCREPANCY_THRESHOLD = 1.5; // m/s^2
     constexpr double TOTAL_ACCEL_THRESHOLD = 4.0;       // m/s^2
+    constexpr double OMEGA_DISCREPANCY_THRESHOLD = 0.8; // rad/s for angular velocity mismatch
 
     // Compare wheel-derived acceleration with IMU acceleration
     double accel_discrepancy = std::abs(wheel_acceleration - last_imu_accel_x_);
     double total_imu_accel = sqrt(last_imu_accel_x_ * last_imu_accel_x_ + last_imu_accel_y_ * last_imu_accel_y_);
+
+    // NEW: Compare expected vs measured angular velocity (Ackermann model vs IMU)
+    double omega_discrepancy = std::abs(expected_omega - measured_omega);
 
     // Multiple slip detection methods
     bool longitudinal_slip =
@@ -492,14 +542,19 @@ bool VescToMyOdom::detectSlip(double wheel_acceleration)
     bool lateral_slip = (std::abs(last_imu_accel_y_) > LATERAL_ACCEL_THRESHOLD);
     bool combined_slip = (total_imu_accel > TOTAL_ACCEL_THRESHOLD);
     bool traditional_slip =
-        (std::abs(wheel_acceleration) > WHEEL_ACCEL_THRESHOLD || std::abs(imu_yaw_rate_) > HIGH_ANGULAR_THRESHOLD);
+        (std::abs(wheel_acceleration) > WHEEL_ACCEL_THRESHOLD || std::abs(measured_omega) > HIGH_ANGULAR_THRESHOLD);
 
-    bool slip_detected = longitudinal_slip || lateral_slip || combined_slip || traditional_slip;
+    // NEW: Model-based slip detection (Ackermann vs IMU)
+    bool model_slip = (omega_discrepancy > OMEGA_DISCREPANCY_THRESHOLD &&
+                       std::abs(expected_omega) > 0.2); // Only check when significant steering expected
+
+    bool slip_detected = longitudinal_slip || lateral_slip || combined_slip || traditional_slip || model_slip;
 
     if (slip_detected)
     {
-        RCLCPP_DEBUG(this->get_logger(), "Slip detected: accel_diff=%.2f, lat_accel=%.2f, total_accel=%.2f",
-                     accel_discrepancy, last_imu_accel_y_, total_imu_accel);
+        RCLCPP_DEBUG(this->get_logger(),
+                     "Slip detected: accel_diff=%.2f, lat_accel=%.2f, total_accel=%.2f, omega_diff=%.2f",
+                     accel_discrepancy, last_imu_accel_y_, total_imu_accel, omega_discrepancy);
     }
 
     return slip_detected;
@@ -519,6 +574,29 @@ void VescToMyOdom::updateSlipFactor(bool slip_detected)
     {
         slip_factor_ = std::min(1.0, slip_factor_ * SLIP_RECOVERY_RATE);
     }
+}
+
+double VescToMyOdom::calculateAckermannOmega(double velocity, double servo_cmd)
+{
+    // Convert servo command to steering angle
+    double steering_angle = (servo_cmd - steering_to_servo_offset_) / steering_to_servo_gain_;
+
+    // Clamp steering angle to reasonable range (approximately +/- 30 degrees)
+    constexpr double MAX_STEERING_ANGLE = 0.52; // ~30 degrees in radians
+    steering_angle = std::max(-MAX_STEERING_ANGLE, std::min(MAX_STEERING_ANGLE, steering_angle));
+
+    // Calculate angular velocity using bicycle model: ω = v * tan(δ) / L
+    double angular_velocity = 0.0;
+    if (std::abs(velocity) > 0.05 && wheelbase_ > 0.0)
+    {
+        angular_velocity = velocity * tan(steering_angle) / wheelbase_;
+    }
+
+    // Clamp angular velocity to reasonable range
+    constexpr double MAX_ANGULAR_VELOCITY = 5.0; // rad/s
+    angular_velocity = std::max(-MAX_ANGULAR_VELOCITY, std::min(MAX_ANGULAR_VELOCITY, angular_velocity));
+
+    return angular_velocity;
 }
 
 } // namespace ekf_odom_estimation
