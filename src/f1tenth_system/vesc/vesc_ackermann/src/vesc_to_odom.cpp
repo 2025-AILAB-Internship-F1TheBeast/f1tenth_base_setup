@@ -554,7 +554,8 @@ void VescToMyOdom::updateImuAcceleration(const vesc_msgs::msg::VescImuStamped::S
     last_imu_accel_y_ = imu_accel_y;
 }
 
-// --------------------------------- ENHANCED SLIP DETECTION (5 METHODS) ---------------------------------\nbool VescToMyOdom::detectSlip(double wheel_acceleration, double expected_omega, double measured_omega)
+// --------------------------------- ENHANCED SLIP DETECTION (5 METHODS) ---------------------------------
+bool VescToMyOdom::detectSlip(double wheel_acceleration, double expected_omega, double measured_omega)
 {
     // Slip detection thresholds
     constexpr double WHEEL_ACCEL_THRESHOLD = 2.5;       // m/s^2 from wheel speed
