@@ -1,3 +1,10 @@
+#include <cmath>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <queue>
+#include <string>
+
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -6,12 +13,6 @@
 #include "vesc_msgs/msg/vesc_imu_stamped.hpp"
 #include "vesc_msgs/msg/vesc_state_stamped.hpp"
 #include <Eigen/Dense>
-#include <cmath>
-#include <iostream>
-#include <limits>
-#include <memory>
-#include <queue>
-#include <string>
 
 using std::placeholders::_1;
 
@@ -39,9 +40,15 @@ class VescToMyOdom : public rclcpp::Node
     explicit VescToMyOdom(const rclcpp::NodeOptions &options = rclcpp::NodeOptions());
 
   private:
+    // Callback functions
     void vescStateCallback(const vesc_msgs::msg::VescStateStamped::SharedPtr state);
     void imuCallback(const vesc_msgs::msg::VescImuStamped::SharedPtr imu);
     void servoCmdCallback(const std_msgs::msg::Float64::SharedPtr servo);
+
+    // Helper functions
+    void updateImuAcceleration(const vesc_msgs::msg::VescImuStamped::SharedPtr imu);
+    bool detectSlip(double wheel_acceleration);
+    void updateSlipFactor(bool slip_detected);
 
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
     rclcpp::Subscription<vesc_msgs::msg::VescStateStamped>::SharedPtr vesc_state_sub_;
@@ -73,6 +80,11 @@ class VescToMyOdom : public rclcpp::Node
     double slip_factor_;
     std::queue<double> speed_history_;
     std::queue<double> accel_history_;
+
+    // IMU acceleration for slip detection
+    std::queue<double> imu_accel_x_history_;
+    std::queue<double> imu_accel_y_history_;
+    double last_imu_accel_x_, last_imu_accel_y_;
 
     // IMU outlier detection
     std::queue<double> imu_yaw_history_;
@@ -131,13 +143,13 @@ void EKF::update(double measured_theta, double R_val, double imu_offset, double 
     double theta_pred = x_(2);
 
     // Compensate for IMU offset during rotation
+    // IMU is between front-rear axles, so minimal theta correction needed
     double imu_theta_correction = 0.0;
-    if (std::abs(angular_vel) > 0.01 && imu_offset != 0.0)
+    if (std::abs(angular_vel) > 0.1 && imu_offset != 0.0)
     {
-        // IMU is ahead of rear axle, so it "sees" the future heading
-        // Correct by subtracting the angular displacement of the IMU position
-        double dt_effective = 0.01; // Small time step for correction
-        imu_theta_correction = angular_vel * dt_effective * (imu_offset / (imu_offset + 0.1));
+        // Small correction for IMU being slightly ahead of vehicle center
+        double dt_effective = 0.005; // Smaller correction since IMU is closer to center
+        imu_theta_correction = angular_vel * dt_effective * (imu_offset * 0.3); // Reduced factor
     }
 
     double corrected_measured_theta = measured_theta - imu_theta_correction;
@@ -185,13 +197,13 @@ double EKF::getBias()
 VescToMyOdom::VescToMyOdom(const rclcpp::NodeOptions &options)
     : Node("vesc_to_my_odom_node", options), x_(0.0), y_(0.0), initial_yaw_(0.0), imu_yaw_rate_(0.0),
       real_yaw_rate_(0.0), last_servo_cmd_(nullptr), ekf_initialized_(false), initialization_time_(rclcpp::Time(0)),
-      last_speed_(0.0), slip_factor_(1.0), last_imu_yaw_(0.0)
+      last_speed_(0.0), slip_factor_(1.0), last_imu_accel_x_(0.0), last_imu_accel_y_(0.0), last_imu_yaw_(0.0)
 {
     odom_frame_ = declare_parameter("odom_frame", "odom");
     base_frame_ = declare_parameter("base_frame", "base_link");
     speed_to_erpm_gain_ = declare_parameter("speed_to_erpm_gain", 4200.0);
     speed_to_erpm_offset_ = declare_parameter("speed_to_erpm_offset", 0.0);
-    wheelbase_ = declare_parameter("wheelbase", 0.34);
+    wheelbase_ = declare_parameter("wheelbase", 0.324);
     steering_to_servo_gain_ = declare_parameter("steering_angle_to_servo_gain", -1.2135);
     steering_to_servo_offset_ = declare_parameter("steering_angle_to_servo_offset", 0.570526);
     imu_offset_x_ = declare_parameter("imu_offset_x", 0.20); // 200mm forward from rear axle
@@ -235,6 +247,9 @@ void VescToMyOdom::imuCallback(const vesc_msgs::msg::VescImuStamped::SharedPtr i
 
     double imu_angular_velocity_z_deg = -imu->imu.angular_velocity.z;
     double raw_yaw_rate = imu_angular_velocity_z_deg * M_PI / 180.0;
+
+    // Update IMU acceleration data for slip detection
+    updateImuAcceleration(imu);
 
     // Outlier detection for IMU measurements
     bool is_outlier = false;
@@ -364,18 +379,9 @@ void VescToMyOdom::vescStateCallback(const vesc_msgs::msg::VescStateStamped::Sha
             accel_history_.pop();
         }
 
-        // Detect slip based on high acceleration and angular velocity
-        double high_accel_threshold = 3.0;   // m/s^2
-        double high_angular_threshold = 2.0; // rad/s
-
-        if (std::abs(acceleration) > high_accel_threshold || std::abs(imu_yaw_rate_) > high_angular_threshold)
-        {
-            slip_factor_ = std::max(0.7, slip_factor_ * 0.95); // Reduce trust in wheel odometry
-        }
-        else
-        {
-            slip_factor_ = std::min(1.0, slip_factor_ * 1.02); // Gradually restore trust
-        }
+        // Enhanced slip detection using IMU acceleration
+        bool wheel_slip_detected = detectSlip(acceleration);
+        updateSlipFactor(wheel_slip_detected);
 
         // Apply slip compensation to speed
         current_speed *= slip_factor_;
@@ -445,6 +451,74 @@ void VescToMyOdom::vescStateCallback(const vesc_msgs::msg::VescStateStamped::Sha
     }
 
     odom_pub_->publish(odom_msg);
+}
+
+// Helper function implementations
+void VescToMyOdom::updateImuAcceleration(const vesc_msgs::msg::VescImuStamped::SharedPtr imu)
+{
+    double imu_accel_x = imu->imu.linear_acceleration.x; // Forward acceleration
+    double imu_accel_y = imu->imu.linear_acceleration.y; // Lateral acceleration
+
+    // Update IMU acceleration history
+    imu_accel_x_history_.push(imu_accel_x);
+    imu_accel_y_history_.push(imu_accel_y);
+
+    if (imu_accel_x_history_.size() > 10)
+    {
+        imu_accel_x_history_.pop();
+        imu_accel_y_history_.pop();
+    }
+
+    last_imu_accel_x_ = imu_accel_x;
+    last_imu_accel_y_ = imu_accel_y;
+}
+
+bool VescToMyOdom::detectSlip(double wheel_acceleration)
+{
+    // Slip detection thresholds
+    constexpr double WHEEL_ACCEL_THRESHOLD = 2.5;       // m/s^2 from wheel speed
+    constexpr double HIGH_ANGULAR_THRESHOLD = 2.0;      // rad/s
+    constexpr double LATERAL_ACCEL_THRESHOLD = 3.0;     // m/s^2 for cornering slip
+    constexpr double ACCEL_DISCREPANCY_THRESHOLD = 1.5; // m/s^2
+    constexpr double TOTAL_ACCEL_THRESHOLD = 4.0;       // m/s^2
+
+    // Compare wheel-derived acceleration with IMU acceleration
+    double accel_discrepancy = std::abs(wheel_acceleration - last_imu_accel_x_);
+    double total_imu_accel = sqrt(last_imu_accel_x_ * last_imu_accel_x_ + last_imu_accel_y_ * last_imu_accel_y_);
+
+    // Multiple slip detection methods
+    bool longitudinal_slip =
+        (accel_discrepancy > ACCEL_DISCREPANCY_THRESHOLD && std::abs(wheel_acceleration) > WHEEL_ACCEL_THRESHOLD);
+    bool lateral_slip = (std::abs(last_imu_accel_y_) > LATERAL_ACCEL_THRESHOLD);
+    bool combined_slip = (total_imu_accel > TOTAL_ACCEL_THRESHOLD);
+    bool traditional_slip =
+        (std::abs(wheel_acceleration) > WHEEL_ACCEL_THRESHOLD || std::abs(imu_yaw_rate_) > HIGH_ANGULAR_THRESHOLD);
+
+    bool slip_detected = longitudinal_slip || lateral_slip || combined_slip || traditional_slip;
+
+    if (slip_detected)
+    {
+        RCLCPP_DEBUG(this->get_logger(), "Slip detected: accel_diff=%.2f, lat_accel=%.2f, total_accel=%.2f",
+                     accel_discrepancy, last_imu_accel_y_, total_imu_accel);
+    }
+
+    return slip_detected;
+}
+
+void VescToMyOdom::updateSlipFactor(bool slip_detected)
+{
+    constexpr double MIN_SLIP_FACTOR = 0.6;
+    constexpr double SLIP_REDUCTION_RATE = 0.92;
+    constexpr double SLIP_RECOVERY_RATE = 1.03;
+
+    if (slip_detected)
+    {
+        slip_factor_ = std::max(MIN_SLIP_FACTOR, slip_factor_ * SLIP_REDUCTION_RATE);
+    }
+    else
+    {
+        slip_factor_ = std::min(1.0, slip_factor_ * SLIP_RECOVERY_RATE);
+    }
 }
 
 } // namespace ekf_odom_estimation
