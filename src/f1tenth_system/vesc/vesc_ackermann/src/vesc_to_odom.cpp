@@ -1,3 +1,6 @@
+// ================================================================================================
+// INCLUDES & NAMESPACE
+// ================================================================================================
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -5,6 +8,7 @@
 #include <queue>
 #include <string>
 
+#include <Eigen/Dense>
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -12,27 +16,30 @@
 #include "tf2_ros/transform_broadcaster.h"
 #include "vesc_msgs/msg/vesc_imu_stamped.hpp"
 #include "vesc_msgs/msg/vesc_state_stamped.hpp"
-#include <Eigen/Dense>
 
 using std::placeholders::_1;
 
 namespace ekf_odom_estimation
 {
 
+// ================================================================================================
+// EXTENDED KALMAN FILTER CLASS - State Estimation Core
+// State Vector: [x, y, theta, imu_bias]
+// ================================================================================================
 class EKF
 {
-  public:
+public:
     EKF();
-    void predict(double dt, double v, double w);
-    void update(double measured_omega, double R_val); // Angular velocity update
-    void updateHeading(double measured_theta, double R_val, double imu_offset = 0.0, double angular_vel = 0.0);
+    void predict(double dt, double v, double w);  // Prediction step with motion model
+    void update(double measured_omega, double R_val);  // Update with IMU angular velocity
+    void updateHeading(double measured_theta, double R_val, double imu_offset = 0.0, double angular_vel = 0.0);  // Update with IMU heading
     void setState(const Eigen::Vector4d &state);
     Eigen::Vector4d getState();
     double getBias();
 
-  private:
-    Eigen::Vector4d x_; // [x, y, theta, bias]
-    Eigen::Matrix4d P_;
+private:
+    Eigen::Vector4d x_; // State: [x, y, theta, bias]
+    Eigen::Matrix4d P_; // Covariance matrix
 };
 
 class VescToMyOdom : public rclcpp::Node
@@ -97,13 +104,18 @@ class VescToMyOdom : public rclcpp::Node
     std::queue<vesc_msgs::msg::VescStateStamped::SharedPtr> vesc_buffer_;
 };
 
+// ================================================================================================
+// EKF IMPLEMENTATION - Extended Kalman Filter Methods
+// ================================================================================================
 EKF::EKF()
 {
-    x_ = Eigen::Vector4d::Zero(); // [x, y, theta, bias]
-    P_ = Eigen::Matrix4d::Identity() * 0.1;
-    P_(3, 3) = 0.01; // Lower initial uncertainty for bias
+    x_ = Eigen::Vector4d::Zero(); // Initialize state: [x, y, theta, bias]
+    P_ = Eigen::Matrix4d::Identity() * 0.1;  // Initial covariance
+    P_(3, 3) = 0.01; // Lower initial uncertainty for IMU bias
 }
 
+// --------------------------------- EKF PREDICTION STEP ---------------------------------
+// Uses motion model: x += v*cos(θ)*dt, y += v*sin(θ)*dt, θ += (ω-bias)*dt
 void EKF::predict(double dt, double v, double w)
 {
     double theta = x_(2);
@@ -140,6 +152,8 @@ void EKF::predict(double dt, double v, double w)
     x_ = x_pred;
 }
 
+// --------------------------------- EKF UPDATE: ANGULAR VELOCITY ---------------------------------
+// Updates IMU bias using angular velocity measurement from IMU
 void EKF::update(double measured_omega, double R_val)
 {
     // Update using angular velocity measurement (IMU)
@@ -165,6 +179,8 @@ void EKF::update(double measured_omega, double R_val)
     P_ = (Eigen::Matrix4d::Identity() - K * H) * P_;
 }
 
+// --------------------------------- EKF UPDATE: HEADING ANGLE ---------------------------------
+// Updates vehicle heading using IMU yaw measurement (with offset compensation)
 void EKF::updateHeading(double measured_theta, double R_val, double imu_offset, double angular_vel)
 {
     double theta_pred = x_(2);
@@ -221,23 +237,30 @@ double EKF::getBias()
     return x_(3);
 }
 
+// ================================================================================================
+// NODE CONSTRUCTOR - Initialize ROS2 Node & Parameters
+// ================================================================================================
 VescToMyOdom::VescToMyOdom(const rclcpp::NodeOptions &options)
     : Node("vesc_to_my_odom_node", options), x_(0.0), y_(0.0), initial_yaw_(0.0), imu_yaw_rate_(0.0),
       real_yaw_rate_(0.0), last_servo_cmd_(nullptr), ekf_initialized_(false), initialization_time_(rclcpp::Time(0)),
       last_speed_(0.0), slip_factor_(1.0), last_imu_accel_x_(0.0), last_imu_accel_y_(0.0), last_imu_yaw_(0.0)
 {
+    // --------------------------------- LOAD ROS2 PARAMETERS ---------------------------------
     odom_frame_ = declare_parameter("odom_frame", "odom");
     base_frame_ = declare_parameter("base_frame", "base_link");
-    // Parameters now loaded above with correct original values
+    
+    // Vehicle & sensor parameters (loaded from f1tenth_stack/config/vesc.yaml)
     wheelbase_ = this->declare_parameter<double>("wheelbase", 0.324);
     steering_to_servo_gain_ = this->declare_parameter<double>("steering_angle_to_servo_gain", -1.2135);
     steering_to_servo_offset_ = this->declare_parameter<double>("steering_angle_to_servo_offset", 0.1667);
     speed_to_erpm_gain_ = this->declare_parameter<double>("speed_to_erpm_gain", 4614.0);
     speed_to_erpm_offset_ = this->declare_parameter<double>("speed_to_erpm_offset", 0.0);
     imu_offset_x_ = declare_parameter("imu_offset_x", 0.20); // 200mm forward from rear axle
+    // Behavior parameters
     publish_tf_ = declare_parameter("publish_tf", false);
     use_servo_cmd_ = declare_parameter("use_servo_cmd_to_calc_angular_velocity", true);
 
+    // --------------------------------- SETUP ROS2 PUBLISHERS & SUBSCRIBERS ---------------------------------
     odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("odom", 10);
 
     if (publish_tf_)
@@ -257,7 +280,7 @@ VescToMyOdom::VescToMyOdom(const rclcpp::NodeOptions &options)
                                                                  std::bind(&VescToMyOdom::servoCmdCallback, this, _1));
     }
 
-    // Initialize EKF at origin
+    // --------------------------------- INITIALIZE EKF STATE ---------------------------------
     Eigen::Vector4d init_state;
     init_state(0) = 0.0; // x
     init_state(1) = 0.0; // y
@@ -268,18 +291,22 @@ VescToMyOdom::VescToMyOdom(const rclcpp::NodeOptions &options)
     last_time_ = this->now();
 }
 
+// ================================================================================================
+// IMU CALLBACK - Process IMU Data & Update EKF
+// ================================================================================================
 void VescToMyOdom::imuCallback(const vesc_msgs::msg::VescImuStamped::SharedPtr imu)
 {
+    // --------------------------------- EXTRACT IMU DATA ---------------------------------
     double measured_yaw_deg = -imu->imu.ypr.z;
     double measured_yaw_rad = measured_yaw_deg * M_PI / 180.0;
 
     double imu_angular_velocity_z_deg = -imu->imu.angular_velocity.z;
     double raw_yaw_rate = imu_angular_velocity_z_deg * M_PI / 180.0;
 
-    // Update IMU acceleration data for slip detection
+    // --------------------------------- UPDATE IMU ACCELERATION FOR SLIP DETECTION ---------------------------------
     updateImuAcceleration(imu);
 
-    // Outlier detection for IMU measurements
+    // --------------------------------- IMU OUTLIER DETECTION ---------------------------------
     bool is_outlier = false;
 
     // Update IMU history
@@ -371,11 +398,15 @@ void VescToMyOdom::imuCallback(const vesc_msgs::msg::VescImuStamped::SharedPtr i
     ekf_.updateHeading(corrected_yaw, R_yaw, imu_offset_x_, imu_yaw_rate_);
 }
 
+// --------------------------------- SERVO COMMAND CALLBACK ---------------------------------
 void VescToMyOdom::servoCmdCallback(const std_msgs::msg::Float64::SharedPtr servo)
 {
     last_servo_cmd_ = servo;
 }
 
+// ================================================================================================
+// VESC STATE CALLBACK - Main Odometry Processing & EKF Prediction
+// ================================================================================================
 void VescToMyOdom::vescStateCallback(const vesc_msgs::msg::VescStateStamped::SharedPtr state)
 {
     if (!ekf_initialized_)
@@ -499,7 +530,11 @@ void VescToMyOdom::vescStateCallback(const vesc_msgs::msg::VescStateStamped::Sha
     odom_pub_->publish(odom_msg);
 }
 
-// Helper function implementations
+// ================================================================================================
+// HELPER FUNCTIONS - Slip Detection, Ackermann Model, etc.
+// ================================================================================================
+
+// --------------------------------- UPDATE IMU ACCELERATION DATA ---------------------------------
 void VescToMyOdom::updateImuAcceleration(const vesc_msgs::msg::VescImuStamped::SharedPtr imu)
 {
     double imu_accel_x = imu->imu.linear_acceleration.x; // Forward acceleration
@@ -519,7 +554,7 @@ void VescToMyOdom::updateImuAcceleration(const vesc_msgs::msg::VescImuStamped::S
     last_imu_accel_y_ = imu_accel_y;
 }
 
-bool VescToMyOdom::detectSlip(double wheel_acceleration, double expected_omega, double measured_omega)
+// --------------------------------- ENHANCED SLIP DETECTION (5 METHODS) ---------------------------------\nbool VescToMyOdom::detectSlip(double wheel_acceleration, double expected_omega, double measured_omega)
 {
     // Slip detection thresholds
     constexpr double WHEEL_ACCEL_THRESHOLD = 2.5;       // m/s^2 from wheel speed
@@ -560,25 +595,30 @@ bool VescToMyOdom::detectSlip(double wheel_acceleration, double expected_omega, 
     return slip_detected;
 }
 
+// --------------------------------- UPDATE SLIP COMPENSATION FACTOR ---------------------------------
 void VescToMyOdom::updateSlipFactor(bool slip_detected)
 {
-    constexpr double MIN_SLIP_FACTOR = 0.6;
-    constexpr double SLIP_REDUCTION_RATE = 0.92;
-    constexpr double SLIP_RECOVERY_RATE = 1.03;
+    constexpr double MIN_SLIP_FACTOR = 0.6;      // Minimum trust in wheel odometry
+    constexpr double SLIP_REDUCTION_RATE = 0.92; // Aggressive reduction during slip
+    constexpr double SLIP_RECOVERY_RATE = 1.03;  // Gradual recovery when no slip
 
     if (slip_detected)
     {
+        // Reduce trust in wheel odometry during slip
         slip_factor_ = std::max(MIN_SLIP_FACTOR, slip_factor_ * SLIP_REDUCTION_RATE);
     }
     else
     {
+        // Gradually restore trust when no slip detected
         slip_factor_ = std::min(1.0, slip_factor_ * SLIP_RECOVERY_RATE);
     }
 }
 
+// --------------------------------- ACKERMANN STEERING MODEL ---------------------------------
+// Calculate expected angular velocity from servo command using bicycle model
 double VescToMyOdom::calculateAckermannOmega(double velocity, double servo_cmd)
 {
-    // Convert servo command to steering angle
+    // Convert servo command to steering angle (radians)
     double steering_angle = (servo_cmd - steering_to_servo_offset_) / steering_to_servo_gain_;
 
     // Clamp steering angle to reasonable range (approximately +/- 30 degrees)
