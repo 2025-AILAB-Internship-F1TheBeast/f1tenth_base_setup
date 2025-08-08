@@ -81,7 +81,7 @@ class VescToMyOdom : public rclcpp::Node {
 public:
   VescToMyOdom(const rclcpp::NodeOptions & options = rclcpp::NodeOptions())
   : Node("vesc_to_my_odom_node", options),
-    x_(0.0), y_(0.0), initial_yaw_(0.0), initialized_(false)
+    x_(0.0), y_(0.0), initial_yaw_(0.0), initialized_(false), compensated_yaw_rate_(0.0)
   {
     // Parameters
     odom_frame_ = declare_parameter("odom_frame", "odom");
@@ -91,6 +91,7 @@ public:
     wheelbase_ = declare_parameter("wheelbase", 0.324);
     steering_to_servo_gain_ = declare_parameter("steering_angle_to_servo_gain", -1.2135);
     steering_to_servo_offset_ = declare_parameter("steering_angle_to_servo_offset", 0.1667);
+    imu_offset_x_ = this->declare_parameter<double>("imu_offset_x", 0.20); // IMU offset from rear axle
     publish_tf_ = declare_parameter("publish_tf", false);
     use_servo_cmd_ = declare_parameter("use_servo_cmd_to_calc_angular_velocity", true);
 
@@ -142,8 +143,11 @@ private:
     double dt = (current_time - last_time_).seconds();
     
     if (dt > 0.001 && dt < 1.0) {
+      // Use compensated IMU yaw rate for prediction (more accurate than Ackermann model)
+      double prediction_omega = compensated_yaw_rate_;
+      
       // EKF predict step
-      ekf_.predict(dt, current_speed, angular_velocity);
+      ekf_.predict(dt, current_speed, prediction_omega);
       
       // Get state estimate
       Eigen::Vector3d state_est = ekf_.getState();
@@ -151,7 +155,7 @@ private:
       y_ = state_est(1);
       double theta_est = state_est(2);
 
-      // Publish odometry
+      // Publish odometry (use Ackermann angular velocity for twist message)
       publishOdometry(state->header.stamp, current_speed, angular_velocity, theta_est);
     }
 
@@ -161,6 +165,11 @@ private:
   void imuCallback(const vesc_msgs::msg::VescImuStamped::SharedPtr imu) {
     double measured_yaw_deg = -imu->imu.ypr.z;
     double measured_yaw_rad = measured_yaw_deg * M_PI / 180.0;
+
+    // Get IMU angular velocity and apply offset compensation
+    double imu_yaw_rate = -imu->imu.angular_velocity.z * M_PI / 180.0;
+    // Compensate for IMU position offset (similar to reference code)
+    double compensated_yaw_rate = imu_yaw_rate * (1.0 - imu_offset_x_ / wheelbase_);
 
     if (!initialized_) {
       initial_yaw_ = measured_yaw_rad;
@@ -180,6 +189,9 @@ private:
     // EKF update step
     double R_yaw = 0.05;
     ekf_.update(corrected_yaw, R_yaw);
+    
+    // Store compensated yaw rate for use in prediction
+    compensated_yaw_rate_ = compensated_yaw_rate;
   }
 
   void servoCmdCallback(const std_msgs::msg::Float64::SharedPtr servo) {
@@ -245,6 +257,7 @@ private:
   double wheelbase_;
   double steering_to_servo_gain_;
   double steering_to_servo_offset_;
+  double imu_offset_x_;  // IMU offset from rear axle (positive = forward)
   bool publish_tf_;
   bool use_servo_cmd_;
 
@@ -252,6 +265,7 @@ private:
   double x_, y_;
   double initial_yaw_;
   bool initialized_;
+  double compensated_yaw_rate_;  // IMU yaw rate compensated for position offset
   std::shared_ptr<std_msgs::msg::Float64> last_servo_cmd_;
   rclcpp::Time last_time_;
 
