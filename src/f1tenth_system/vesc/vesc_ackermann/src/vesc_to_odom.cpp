@@ -39,7 +39,10 @@ public:
     F(0,2) = -v * sin(theta) * dt;
     F(1,2) = v * cos(theta) * dt;
 
-    Eigen::Matrix3d Q = Eigen::Matrix3d::Identity() * 0.01;
+    Eigen::Matrix3d Q = Eigen::Matrix3d::Identity();
+    Q(0,0) = 0.01;  // x position noise
+    Q(1,1) = 0.01;  // y position noise  
+    Q(2,2) = 0.05;  // theta noise (higher for angle)
 
     P_ = F * P_ * F.transpose() + Q;
     x_ = x_pred;
@@ -168,8 +171,8 @@ private:
 
     // Get IMU angular velocity and apply offset compensation
     double imu_yaw_rate = -imu->imu.angular_velocity.z * M_PI / 180.0;
-    // Compensate for IMU position offset (similar to reference code)
-    double compensated_yaw_rate = imu_yaw_rate * (1.0 - imu_offset_x_ / wheelbase_);
+    // Compensate for IMU position offset - more conservative approach
+    double compensated_yaw_rate = imu_yaw_rate;
 
     if (!initialized_) {
       initial_yaw_ = measured_yaw_rad;
@@ -187,7 +190,7 @@ private:
     while (corrected_yaw < -M_PI) corrected_yaw += 2 * M_PI;
 
     // EKF update step
-    double R_yaw = 0.05;
+    double R_yaw = 0.01;  // Lower value = higher trust in IMU
     ekf_.update(corrected_yaw, R_yaw);
     
     // Store compensated yaw rate for use in prediction
