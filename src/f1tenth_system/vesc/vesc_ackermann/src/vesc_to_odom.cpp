@@ -84,7 +84,9 @@ class VescToMyOdom : public rclcpp::Node {
 public:
   VescToMyOdom(const rclcpp::NodeOptions & options = rclcpp::NodeOptions())
   : Node("vesc_to_my_odom_node", options),
-    x_(0.0), y_(0.0), initial_yaw_(0.0), initialized_(false), compensated_yaw_rate_(0.0)
+    x_(0.0), y_(0.0), initial_yaw_(0.0), initialized_(false), compensated_yaw_rate_(0.0),
+    last_speed_(0.0), last_angular_velocity_(0.0), last_theta_(0.0),
+    ekf_reference_x_(0.0), ekf_reference_y_(0.0), ekf_reference_theta_(0.0)
   {
     // Parameters
     odom_frame_ = declare_parameter("odom_frame", "odom");
@@ -118,8 +120,14 @@ public:
     }
 
     last_time_ = this->now();
+    last_update_time_ = this->now();
     
-    RCLCPP_INFO(this->get_logger(), "Simple VESC odometry node initialized");
+    // Create 100Hz timer for high-frequency odometry publishing
+    high_freq_timer_ = create_wall_timer(
+      std::chrono::milliseconds(10), // 100Hz = 10ms period
+      std::bind(&VescToMyOdom::highFreqCallback, this));
+    
+    RCLCPP_INFO(this->get_logger(), "Simple VESC odometry node initialized with 100Hz interpolation");
   }
 
 private:
@@ -149,17 +157,25 @@ private:
       // Use compensated IMU yaw rate for prediction (more accurate than Ackermann model)
       double prediction_omega = compensated_yaw_rate_;
       
-      // EKF predict step
+      // EKF predict step - only update orientation and cache position base
       ekf_.predict(dt, current_speed, prediction_omega);
       
-      // Get state estimate
+      // Get state estimate from EKF (this is our reference position)
       Eigen::Vector3d state_est = ekf_.getState();
       x_ = state_est(0);
       y_ = state_est(1);
       double theta_est = state_est(2);
 
-      // Publish odometry (use Ackermann angular velocity for twist message)
-      publishOdometry(state->header.stamp, current_speed, angular_velocity, theta_est);
+      // Update cached values for high-frequency interpolation
+      last_speed_ = current_speed;
+      last_angular_velocity_ = angular_velocity;
+      last_theta_ = theta_est;
+      last_update_time_ = current_time;
+      
+      // Cache EKF reference position for interpolation
+      ekf_reference_x_ = x_;
+      ekf_reference_y_ = y_;
+      ekf_reference_theta_ = theta_est;
     }
 
     last_time_ = current_time;
@@ -193,7 +209,7 @@ private:
     double R_yaw = 0.01;  // Lower value = higher trust in IMU
     ekf_.update(corrected_yaw, R_yaw);
     
-    // Store compensated yaw rate for use in prediction
+    // Store compensated yaw rate for use in prediction  
     compensated_yaw_rate_ = compensated_yaw_rate;
   }
 
@@ -201,15 +217,50 @@ private:
     last_servo_cmd_ = servo;
   }
 
+  void highFreqCallback() {
+    if (!initialized_) return;
+
+    rclcpp::Time current_time = this->now();
+    double dt_since_update = (current_time - last_update_time_).seconds();
+    
+    // Don't interpolate if too much time has passed (sensor data might be stale)
+    if (dt_since_update > 0.1) { // 100ms threshold
+      return;
+    }
+
+    // Interpolate position from EKF reference using constant velocity model
+    double interpolated_x = ekf_reference_x_ + last_speed_ * cos(ekf_reference_theta_) * dt_since_update;
+    double interpolated_y = ekf_reference_y_ + last_speed_ * sin(ekf_reference_theta_) * dt_since_update;
+    double interpolated_theta = ekf_reference_theta_ + compensated_yaw_rate_ * dt_since_update;
+    
+    // Normalize interpolated theta
+    while (interpolated_theta > M_PI) interpolated_theta -= 2 * M_PI;
+    while (interpolated_theta < -M_PI) interpolated_theta += 2 * M_PI;
+
+    // Publish interpolated odometry at 100Hz
+    publishInterpolatedOdometry(current_time, interpolated_x, interpolated_y, 
+                              interpolated_theta, last_speed_, last_angular_velocity_);
+  }
+
   void publishOdometry(const rclcpp::Time& stamp, double linear_vel, double angular_vel, double theta) {
+    publishOdometryMsg(stamp, x_, y_, theta, linear_vel, angular_vel);
+  }
+
+  void publishInterpolatedOdometry(const rclcpp::Time& stamp, double x, double y, double theta, 
+                                 double linear_vel, double angular_vel) {
+    publishOdometryMsg(stamp, x, y, theta, linear_vel, angular_vel);
+  }
+
+  void publishOdometryMsg(const rclcpp::Time& stamp, double x, double y, double theta,
+                         double linear_vel, double angular_vel) {
     nav_msgs::msg::Odometry odom_msg;
     odom_msg.header.stamp = stamp;
     odom_msg.header.frame_id = odom_frame_;
     odom_msg.child_frame_id = base_frame_;
 
     // Position
-    odom_msg.pose.pose.position.x = x_;
-    odom_msg.pose.pose.position.y = y_;
+    odom_msg.pose.pose.position.x = x;
+    odom_msg.pose.pose.position.y = y;
     odom_msg.pose.pose.position.z = 0.0;
     
     // Orientation (quaternion)
@@ -236,8 +287,8 @@ private:
       tf.header.stamp = stamp;
       tf.header.frame_id = odom_frame_;
       tf.child_frame_id = base_frame_;
-      tf.transform.translation.x = x_;
-      tf.transform.translation.y = y_;
+      tf.transform.translation.x = x;
+      tf.transform.translation.y = y;
       tf.transform.translation.z = 0.0;
       tf.transform.rotation = odom_msg.pose.pose.orientation;
       
@@ -251,6 +302,7 @@ private:
   rclcpp::Subscription<vesc_msgs::msg::VescImuStamped>::SharedPtr imu_sub_;
   rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr servo_sub_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_pub_;
+  rclcpp::TimerBase::SharedPtr high_freq_timer_;
 
   // Parameters
   std::string odom_frame_;
@@ -271,6 +323,17 @@ private:
   double compensated_yaw_rate_;  // IMU yaw rate compensated for position offset
   std::shared_ptr<std_msgs::msg::Float64> last_servo_cmd_;
   rclcpp::Time last_time_;
+  rclcpp::Time last_update_time_;
+  
+  // Cached values for interpolation
+  double last_speed_;
+  double last_angular_velocity_;
+  double last_theta_;
+  
+  // EKF reference position for interpolation (to avoid double integration)
+  double ekf_reference_x_;
+  double ekf_reference_y_;
+  double ekf_reference_theta_;
 
   // EKF
   EKF ekf_;
