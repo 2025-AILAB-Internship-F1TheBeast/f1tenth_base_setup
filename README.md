@@ -54,7 +54,7 @@ ros2 launch f1tenth_stack bringup_launch.py
 
 ### Enhanced Keyboard Teleop
 ```bash
-// It is available on devel branch. Not master branch
+# It is available on devel branch. Not master branch
 ros2 run key_teleop key_teleop
 ```
 
