@@ -102,8 +102,9 @@ class PynputCursesKeyTeleop(Node):
         self._steering_deceleration_time = 0.3  # Quick steering return to center (seconds)
         self._initial_linear_speed = 0.4  # Initial speed when key is first pressed (m/s)
         
-        # Message type toggle (True for Ackermann, False for Twist)
-        self._use_ackermann = True
+        # Control mode: 'simulation', 'driving', 'control', 'emergency_stop'
+        self._control_mode = 'control'  # Default to manual control mode
+        self._emergency_stop = False  # Emergency stop flag
         
         # Thread-safe key state tracking with timestamps
         self._key_states = defaultdict(bool)
@@ -127,7 +128,7 @@ class PynputCursesKeyTeleop(Node):
         
         # ROS publishers
         self._pub_ackermann = self.create_publisher(
-            AckermannDriveStamped, '/ackermann_cmd', qos_profile_system_default)
+            AckermannDriveStamped, '/keyboard_teleop', qos_profile_system_default)
         self._pub_twist = self.create_publisher(
             Twist, '/cmd_vel', qos_profile_system_default)
         
@@ -143,30 +144,54 @@ class PynputCursesKeyTeleop(Node):
                 self._running = False
                 return False
             
-            # Handle message type toggle
-            if key == keyboard.KeyCode.from_char('s') or key == keyboard.KeyCode.from_char('S'):
-                self._use_ackermann = not self._use_ackermann
-                msg_type = "Ackermann" if self._use_ackermann else "Twist"
-                self.get_logger().info(f"Switched to {msg_type} mode")
+            # Handle EMERGENCY STOP (Space key)
+            if key == keyboard.Key.space:
+                self._emergency_stop = True
+                self._control_mode = 'control'  # Force to control mode
+                self.get_logger().warn("EMERGENCY STOP ACTIVATED! Press any arrow key to resume.")
                 return
             
-            # Handle speed profile selection
-            if hasattr(key, 'char') and key.char and key.char in self._speed_profiles:
+            # Handle control mode switching
+            if key == keyboard.KeyCode.from_char('s') or key == keyboard.KeyCode.from_char('S'):
+                self._control_mode = 'simulation'
+                self.get_logger().info("Switched to SIMULATION mode - publishing to /cmd_vel")
+                return
+            
+            if key == keyboard.KeyCode.from_char('d') or key == keyboard.KeyCode.from_char('D'):
+                self._control_mode = 'driving'
+                self.get_logger().info("Switched to DRIVING mode - navigation control")
+                return
+            
+            if key == keyboard.KeyCode.from_char('c') or key == keyboard.KeyCode.from_char('C'):
+                self._control_mode = 'control'
+                self.get_logger().info("Switched to CONTROL mode - manual keyboard control")
+                return
+            
+            # Handle speed profile selection (only in control mode)
+            if (self._control_mode == 'control' and hasattr(key, 'char') and 
+                key.char and key.char in self._speed_profiles):
                 self._current_speed_profile = key.char
                 self._max_forward_rate = self._speed_profiles[key.char]
                 self._max_backward_rate = self._max_forward_rate * 0.7
                 self.get_logger().info(f"Speed profile {key.char}: {self._max_forward_rate:.1f} m/s")
                 return
             
-            # Handle movement keys
-            if key in self._key_mappings:
+            # Handle movement keys (only in control and simulation modes)
+            if (key in self._key_mappings and 
+                self._control_mode in ['control', 'simulation']):
+                # Resume from emergency stop when movement key is pressed
+                if self._emergency_stop:
+                    self._emergency_stop = False
+                    self.get_logger().info("Emergency stop released. Resuming normal operation.")
+                
                 with self._state_lock:
                     if not self._key_states[key]:  # Key just pressed
                         self._key_press_times[key] = time.time()
                     self._key_states[key] = True
 
         def on_release(key):
-            if key in self._key_mappings:
+            if (key in self._key_mappings and 
+                self._control_mode in ['control', 'simulation']):
                 with self._state_lock:
                     self._key_states[key] = False
 
@@ -191,9 +216,24 @@ class PynputCursesKeyTeleop(Node):
         active_keys = []
         current_time = time.time()
         
-        with self._state_lock:
-            current_states = dict(self._key_states)
-            current_press_times = dict(self._key_press_times)
+        # Emergency stop overrides everything - force zero velocity
+        if self._emergency_stop:
+            self._linear = 0.0
+            self._angular = 0.0
+            self._target_linear = 0.0
+            self._target_angular = 0.0
+            self._active_keys = ['EMERGENCY STOP']
+            return
+        
+        # Only process movement in control and simulation modes
+        if self._control_mode in ['control', 'simulation']:
+            with self._state_lock:
+                current_states = dict(self._key_states)
+                current_press_times = dict(self._key_press_times)
+        else:
+            # In driving mode, reset all movement
+            current_states = {}
+            current_press_times = {}
         
         # Calculate target velocities based on pressed keys
         for key, is_pressed in current_states.items():
@@ -326,14 +366,30 @@ class PynputCursesKeyTeleop(Node):
         # Display current status
         active_str = ' '.join(self._active_keys) if self._active_keys else 'None'
         
-        # Message type display
-        msg_type = "Ackermann" if self._use_ackermann else "Twist"
-        msg_color = 1 if self._use_ackermann else 2
-        self._interface.write_line(2, f"Mode: {msg_type}", msg_color)
+        # Control mode display with color coding
+        if self._emergency_stop:
+            mode_color = 3  # Red for emergency stop
+            mode_text = "🚨 EMERGENCY STOP 🚨"
+        else:
+            mode_colors = {'simulation': 2, 'driving': 4, 'control': 1}  # Blue for driving mode
+            mode_color = mode_colors.get(self._control_mode, 0)
+            mode_display = {
+                'simulation': 'SIMULATION (Twist/cmd_vel)', 
+                'driving': 'DRIVING (Navigation)', 
+                'control': 'CONTROL (Ackermann/keyboard_teleop)'
+            }
+            mode_text = f"Mode: {mode_display[self._control_mode]}"
         
-        # Speed profile display
-        profile_color = 1
-        self._interface.write_line(3, f"Speed Profile: {self._current_speed_profile} ({self._max_forward_rate:.1f}m/s)", profile_color)
+        self._interface.write_line(2, mode_text, mode_color)
+        
+        # Speed profile display (only in control mode and not emergency stop)
+        if self._control_mode == 'control' and not self._emergency_stop:
+            profile_color = 1
+            self._interface.write_line(3, f"Speed Profile: {self._current_speed_profile} ({self._max_forward_rate:.1f}m/s)", profile_color)
+        elif self._emergency_stop:
+            self._interface.write_line(3, "Speed Profile: EMERGENCY STOP - Press arrow key to resume", 3)
+        else:
+            self._interface.write_line(3, "Speed Profile: N/A (not in control mode)")
         
         # Speed display with color coding
         speed_color = 1 if self._linear > 0 else (3 if self._linear < 0 else 0)
@@ -347,42 +403,77 @@ class PynputCursesKeyTeleop(Node):
         self._interface.write_line(6, f"Keys:     {active_str}")
         
         # Controls display
-        self._interface.write_line(8, "Movement Controls:")
-        self._interface.write_line(9, "↑: Forward      ↓: Backward")
-        self._interface.write_line(10, "←: Left         →: Right")
+        self._interface.write_line(8, "Mode Controls:")
+        self._interface.write_line(9, "S: Simulation   D: Driving   C: Control   SPACE: EMERGENCY STOP")
         
-        # Speed profile controls
-        self._interface.write_line(11, "Speed Profiles (1-0):")
-        self._interface.write_line(12, "1:0.6  2:0.8  3:1.2  4:1.8  5:2.4")
-        self._interface.write_line(13, "6:2.8  7:3.0  8:3.2  9:3.5  0:4.0")
+        if self._emergency_stop:
+            self._interface.write_line(10, "🚨 EMERGENCY STOP ACTIVE - Press arrow key to resume 🚨", 3)
+        elif self._control_mode in ['control', 'simulation']:
+            self._interface.write_line(10, "Movement Controls:")
+            self._interface.write_line(11, "↑: Forward      ↓: Backward")
+            self._interface.write_line(12, "←: Left         →: Right")
+        else:
+            self._interface.write_line(10, "Movement: DISABLED (Driving mode)")
+        
+        # Speed profile controls (only in control mode and not emergency stop)
+        if self._control_mode == 'control' and not self._emergency_stop:
+            self._interface.write_line(13, "Speed Profiles (1-0):")
+            self._interface.write_line(14, "1:0.6  2:0.8  3:1.2  4:1.8  5:2.4")
+            self._interface.write_line(15, "6:2.8  7:3.0  8:3.2  9:3.5  0:4.0")
+        else:
+            self._interface.write_line(13, "Speed Profiles: N/A")
         
         # Other controls
-        self._interface.write_line(14, "S: Toggle Mode  Q: Quit")
+        self._interface.write_line(16, "Q: Quit")
         
-        # Progressive acceleration info
-        self._interface.write_line(15, f"Linear: {self._acceleration_time:.1f}s | Steering: {self._steering_acceleration_time:.1f}s")
+        # Mode-specific info
+        if self._control_mode in ['control', 'simulation']:
+            self._interface.write_line(17, f"Accel: {self._acceleration_time:.1f}s | Steering: {self._steering_acceleration_time:.1f}s")
         
-        # Additional info
-        if self._active_keys:
-            self._interface.write_line(17, "● DRIVING", 1)
+        # Status display
+        if self._emergency_stop:
+            self._interface.write_line(18, "🛑 EMERGENCY STOP ENGAGED 🛑", 3)
+        elif self._control_mode == 'driving':
+            self._interface.write_line(18, "◉ NAVIGATION CONTROL", 4)  # Blue for navigation control
+        elif self._active_keys:
+            self._interface.write_line(18, "● MANUAL DRIVING", 1)
         else:
-            self._interface.write_line(17, "○ STOPPED", 2)
+            status_color = 1 if self._control_mode == 'control' else 2
+            self._interface.write_line(18, f"○ READY ({self._control_mode.upper()})", status_color)
             
-        self._interface.write_line(18, f"Rate: {self._hz} Hz | You can type in other apps!")
+        self._interface.write_line(19, f"Rate: {self._hz} Hz | You can type in other apps!")
         
-        # Topic info
-        topic = "/ackermann_cmd" if self._use_ackermann else "/cmd_vel"
-        self._interface.write_line(19, f"Publishing to: {topic}")
+        # Topic info - show what we're publishing to
+        if self._emergency_stop:
+            topic_info = "Publishing to: /keyboard_teleop (EMERGENCY STOP - zero commands)"
+        elif self._control_mode == 'simulation':
+            topic_info = "Publishing to: /cmd_vel (Twist)"
+        elif self._control_mode == 'control':
+            topic_info = "Publishing to: /keyboard_teleop (Ackermann)"
+        else:
+            topic_info = "Publishing: DISABLED (Navigation mode)"
+        self._interface.write_line(20, topic_info)
         
         self._interface.refresh()
         
-        # Publish appropriate message type
-        if self._use_ackermann:
-            ackermann_msg = self._make_ackermann_msg(self._linear, self._angular)
+        # Publish based on current mode
+        if self._emergency_stop:
+            # Emergency stop: always publish zero Ackermann commands to maintain control
+            ackermann_msg = self._make_ackermann_msg(0.0, 0.0)
             self._pub_ackermann.publish(ackermann_msg)
-        else:
+            
+        elif self._control_mode == 'simulation':
+            # Simulation mode: publish Twist messages to /cmd_vel
             twist_msg = self._make_twist_msg(self._linear, self._angular)
             self._pub_twist.publish(twist_msg)
+            
+        elif self._control_mode == 'control':
+            # Control mode: always publish Ackermann messages to /keyboard_teleop
+            # This ensures the mux knows we're still in control, even when not moving
+            ackermann_msg = self._make_ackermann_msg(self._linear, self._angular)
+            self._pub_ackermann.publish(ackermann_msg)
+            
+        # In driving mode, publish nothing - let navigation take control
 
     def stop(self):
         """Clean shutdown"""
@@ -404,7 +495,7 @@ def execute(stdscr):
     rclpy.init()
     
     try:
-        app = PynputCursesKeyTeleop(TextWindow(stdscr, lines=20))
+        app = PynputCursesKeyTeleop(TextWindow(stdscr, lines=25))
         app.run()
     except KeyboardInterrupt:
         pass

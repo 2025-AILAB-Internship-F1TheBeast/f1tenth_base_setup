@@ -2,7 +2,24 @@
 
 # Copyright (c) 2020 Hongrui Zheng
 
-# Permission is hereby granted, free of charge, to any person obtaining a copy
+# P    key_la = DeclareLaunchArgument(
+        'key_config',
+        default_value=key_teleop_config,
+        description='Descriptions for key_teleop configs')
+    vesc_la = DeclareLaunchArgument(
+        'vesc_config',
+        default_value=vesc_config,
+        description='Descriptions for vesc configs')
+    sensors_la = DeclareLaunchArgument(
+        'sensors_config',
+        default_value=sensors_config,
+        description='Descriptions for sensor configs')
+    mux_la = DeclareLaunchArgument(
+        'mux_config',
+        default_value=mux_config,
+        description='Descriptions for ackermann mux configs')
+
+    ld = LaunchDescription([key_la, vesc_la, sensors_la, mux_la])y granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
 # in the Software without restriction, including without limitation the rights
 # to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
@@ -31,6 +48,11 @@ from ament_index_python.packages import get_package_share_directory
 import os
 
 def generate_launch_description():
+    key_teleop_config = os.path.join(
+        get_package_share_directory('key_teleop'),
+        'config',
+        'key_teleop.yaml'
+    )
     vesc_config = os.path.join(
         get_package_share_directory('f1tenth_stack'),
         'config',
@@ -47,6 +69,10 @@ def generate_launch_description():
         'mux.yaml'
     )
 
+    key_la = DeclareLaunchArgument(
+        'key_config',
+        default_value=key_teleop_config,
+        description='Descriptions for key_teleop configs')
     vesc_la = DeclareLaunchArgument(
         'vesc_config',
         default_value=vesc_config,
@@ -60,8 +86,14 @@ def generate_launch_description():
         default_value=mux_config,
         description='Descriptions for ackermann mux configs')
 
-    ld = LaunchDescription([vesc_la, sensors_la, mux_la])
+    ld = LaunchDescription([key_la, vesc_la, sensors_la, mux_la])
 
+    key_teleop_node = Node(
+        package='key_teleop',
+        executable='key_teleop',
+        name='key_teleop',
+        parameters=[LaunchConfiguration('key_config')]
+    )
     ackermann_to_vesc_node = Node(
         package='vesc_ackermann',
         executable='ackermann_to_vesc_node',
@@ -107,6 +139,7 @@ def generate_launch_description():
     )
 
     # finalize
+    ld.add_action(key_teleop_node)
     ld.add_action(ackermann_to_vesc_node)
     ld.add_action(vesc_to_odom_node)
     ld.add_action(vesc_driver_node)

@@ -5,7 +5,7 @@ ackermann_mux:
         topic   : drive
         timeout : 0.2
         priority: 10
-      joystick:
-        topic   : teleop
+      keyboard:
+        topic   : keyboard_teleop
         timeout : 0.2
         priority: 100
