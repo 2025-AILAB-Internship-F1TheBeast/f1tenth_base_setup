@@ -98,8 +98,8 @@ class PynputCursesKeyTeleop(Node):
         # Progressive acceleration settings
         self._acceleration_time = 0.5  # Time to reach max speed (seconds) - only for linear
         self._deceleration_time = 1.0  # Time to stop when key released (seconds) - only for linear
-        self._steering_acceleration_time = 0.35  # Fast steering response (seconds)
-        self._steering_deceleration_time = 0.3  # Quick steering return to center (seconds)
+        self._steering_acceleration_time = 0.1  # Very fast steering response (seconds)
+        self._steering_deceleration_time = 0.4  # Slower steering return to center (seconds)
         self._initial_linear_speed = 0.4  # Initial speed when key is first pressed (m/s)
         
         # Control mode: 'simulation', 'driving', 'control', 'emergency_stop'
@@ -262,22 +262,14 @@ class PynputCursesKeyTeleop(Node):
                     key_name = self._get_key_name(key)
                     active_keys.append(f"{key_name}({progress:.1%})")
                 
-                if a != 0:  # Angular movement (steering) - fast but progressive
-                    # Calculate how long the steering key has been pressed
-                    press_duration = current_time - current_press_times.get(key, current_time)
+                if a != 0:  # Angular movement (steering) - instant response to eliminate shivering
+                    # Direct assignment for immediate, stable steering
+                    target_angular += a * self._max_rotation_rate
                     
-                    # Fast progressive acceleration for steering: 0 to 1 over steering_acceleration_time
-                    steering_progress = min(press_duration / self._steering_acceleration_time, 1.0)
-                    
-                    # Apply slight easing for smooth steering (less aggressive than linear)
-                    steering_progress = steering_progress * (2 - steering_progress)  # Ease-out
-                    
-                    target_angular += a * steering_progress * self._max_rotation_rate
-                    
-                    # Add to active keys for display with progress
+                    # Add to active keys for display
                     key_name = self._get_key_name(key)
                     if key_name not in [k.split('(')[0] for k in active_keys]:
-                        active_keys.append(f"{key_name}({steering_progress:.1%})")
+                        active_keys.append(f"{key_name}(100%)")
         
         # Store target values
         self._target_linear = target_linear
@@ -305,20 +297,15 @@ class PynputCursesKeyTeleop(Node):
         
         # Angular velocity with fast progressive response
         if abs(target_angular) < 0.01:  # No angular input
-            # Quick deceleration to zero for steering
+            # Slower deceleration to zero for steering to reduce shivering
             decel_rate = self._max_rotation_rate / self._steering_deceleration_time
             if self._angular > 0:
                 self._angular = max(0.0, self._angular - decel_rate * dt)
             elif self._angular < 0:
                 self._angular = min(0.0, self._angular + decel_rate * dt)
         else:
-            # Fast response for steering
-            accel_rate = self._max_rotation_rate / self._steering_acceleration_time
-            diff = target_angular - self._angular
-            if abs(diff) > accel_rate * dt:
-                self._angular += accel_rate * dt * (1 if diff > 0 else -1)
-            else:
-                self._angular = target_angular
+            # Direct assignment to target to maintain steady steering
+            self._angular = target_angular
         
         # Clamp values to reasonable ranges
         self._linear = max(-3.0, min(3.0, self._linear))
