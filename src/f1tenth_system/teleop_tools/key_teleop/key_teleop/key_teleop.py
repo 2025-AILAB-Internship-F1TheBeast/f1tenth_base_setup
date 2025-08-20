@@ -99,7 +99,7 @@ class PynputCursesKeyTeleop(Node):
         self._acceleration_time = 0.5  # Time to reach max speed (seconds) - only for linear
         self._deceleration_time = 1.0  # Time to stop when key released (seconds) - only for linear
         self._steering_acceleration_time = 0.1  # Very fast steering response (seconds)
-        self._steering_deceleration_time = 0.4  # Slower steering return to center (seconds)
+        self._steering_deceleration_time = 0.1  # Faster steering return to center (seconds)
         self._initial_linear_speed = 0.4  # Initial speed when key is first pressed (m/s)
         
         # Control mode: 'simulation', 'driving', 'control', 'emergency_stop'
